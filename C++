@@ -1,0 +1,244 @@
+/*
+ * Project: Aqua Cozy - IoT Smart Aquarium System
+ * Author: Kasidet Khukhit & Natthawat Um-yat
+ * Institution: PIM (Panyapiwat Institute of Management)
+ * Date: 2026
+ * * Description: 
+ * ESP8266 based aquarium controller with Firebase integration, 
+ * Telegram alerts, Google Sheets logging, and Web Dashboard.
+ */
+
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266HTTPClient.h>
+
+// ========================================================
+// ⚙️ CONFIGURATION (แก้ไขข้อมูลส่วนนี้)
+// ========================================================
+// 1. Wi-Fi Setup
+#define WIFI_SSID       "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+
+// 2. Firebase Setup
+#define FIREBASE_HOST   "YOUR_PROJECT_ID.firebaseio.com" // ลบ https:// ออก
+#define FIREBASE_AUTH   "YOUR_FIREBASE_DATABASE_SECRET"
+
+// 3. Telegram Setup
+#define BOT_TOKEN       "YOUR_TELEGRAM_BOT_TOKEN"
+#define CHAT_ID         "YOUR_CHAT_ID"
+
+// 4. Google Script (Web App URL ID)
+String GAS_ID = "YOUR_GOOGLE_SCRIPT_ID"; 
+
+// 5. Hardware Settings
+#define RELAY_ACTIVE_LOW  false  // true ถ้าใช้ Relay ที่ทำงานเมื่อ Low
+const int TANK_HEIGHT_CM = 20;   // ความสูงตู้ปลา (สำหรับวัดระดับน้ำ)
+
+// ========================================================
+// 🔌 PIN DEFINITIONS
+// ========================================================
+#define PIN_PUMP    2   // D4
+#define PIN_OXY     0   // D3
+#define PIN_LIGHT   13  // D7
+#define PIN_TEMP    14  // D5
+#define PIN_TRIG    12  // D6
+#define PIN_ECHO    4   // D2
+#define PIN_TDS     A0  // Analog
+
+#define STATUS_LED  16  // D0 (Onboard LED)
+
+// ========================================================
+// 📦 OBJECTS & VARIABLES
+// ========================================================
+OneWire oneWire(PIN_TEMP);
+DallasTemperature sensors(&oneWire);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long prevMillis = 0;
+unsigned long sheetMillis = 0;
+unsigned long alertMillis = 0;
+
+// State Tracking to prevent spamming notifications
+int lastPump = -1;
+int lastOxy = -1;
+int lastLight = -1;
+
+// ========================================================
+// 🛠️ HELPER FUNCTIONS
+// ========================================================
+
+void sendTelegram(String msg) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  
+  // URL Encode logic inside formatting
+  msg.replace("%", "%25"); 
+  msg.replace(" ", "%20"); 
+  msg.replace("\n", "%0A"); 
+  msg.replace("#", "%23");
+
+  HTTPClient https;
+  String url = "https://api.telegram.org/bot" + String(BOT_TOKEN) + "/sendMessage?chat_id=" + String(CHAT_ID) + "&text=" + msg;
+  
+  if (https.begin(client, url)) { 
+    https.GET(); 
+    https.end(); 
+  }
+}
+
+void sendToSheet(float t, int tds, int lvl) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  
+  // Send data to Google Sheets via Google Apps Script
+  String url = "https://script.google.com/macros/s/" + GAS_ID + "/exec?temp=" + String(t) + "&tds=" + String(tds) + "&level=" + String(lvl);
+  
+  if (https.begin(client, url)) { 
+    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    https.setTimeout(10000);
+    https.GET(); 
+    https.end();
+  }
+}
+
+// ========================================================
+// 🚀 SETUP
+// ========================================================
+void setup() {
+  Serial.begin(115200);
+  
+  // -- Pin Setup --
+  int START_STATE = RELAY_ACTIVE_LOW ? HIGH : LOW; 
+  pinMode(PIN_PUMP, OUTPUT); digitalWrite(PIN_PUMP, START_STATE);
+  pinMode(PIN_OXY, OUTPUT);  digitalWrite(PIN_OXY, START_STATE);
+  pinMode(PIN_LIGHT, OUTPUT); digitalWrite(PIN_LIGHT, START_STATE);
+  
+  pinMode(STATUS_LED, OUTPUT); digitalWrite(STATUS_LED, HIGH); // Off
+  pinMode(PIN_TRIG, OUTPUT); pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_TEMP, INPUT_PULLUP);
+  
+  // -- Sensor Init --
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  
+  // -- WiFi Connection --
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("\nConnecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) { 
+    digitalWrite(STATUS_LED, LOW); delay(100); 
+    digitalWrite(STATUS_LED, HIGH); delay(100);
+    Serial.print("."); 
+  }
+  digitalWrite(STATUS_LED, LOW); // LED ON = Connected
+  Serial.println("\n✅ WiFi Connected");
+
+  // -- Firebase Init --
+  fbdo.setBSSLBufferSize(1024, 1024); 
+  fbdo.setResponseSize(1024);
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  config.timeout.wifiReconnect = 10000;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  sendTelegram("🚀 Aqua Cozy System Online!");
+}
+
+// ========================================================
+// 🔄 LOOP
+// ========================================================
+void loop() {
+  // Connection Status LED
+  digitalWrite(STATUS_LED, (WiFi.status() == WL_CONNECTED) ? LOW : HIGH);
+
+  // --- 1. FIREBASE CONTROL (RECEIVE) ---
+  if (Firebase.ready()) {
+    int ON = RELAY_ACTIVE_LOW ? LOW : HIGH; 
+    int OFF = RELAY_ACTIVE_LOW ? HIGH : LOW;
+
+    // Pump Control
+    if (Firebase.getInt(fbdo, "/config/pumpMode")) {
+      int val = fbdo.intData();
+      digitalWrite(PIN_PUMP, val == 1 ? ON : OFF);
+      if (lastPump != -1 && val != lastPump) sendTelegram(val == 1 ? "✅ Pump: ON" : "⛔ Pump: OFF");
+      lastPump = val;
+    }
+
+    // Oxygen Control
+    if (Firebase.getInt(fbdo, "/config/oxygen")) {
+      int val = fbdo.intData();
+      digitalWrite(PIN_OXY, val == 1 ? ON : OFF);
+      if (lastOxy != -1 && val != lastOxy) sendTelegram(val == 1 ? "✅ Oxy: ON" : "⛔ Oxy: OFF");
+      lastOxy = val;
+    }
+
+    // Light Control
+    if (Firebase.getInt(fbdo, "/config/light")) {
+      int val = fbdo.intData();
+      digitalWrite(PIN_LIGHT, val == 1 ? ON : OFF);
+      if (lastLight != -1 && val != lastLight) sendTelegram(val == 1 ? "💡 Light: ON" : "🌑 Light: OFF");
+      lastLight = val;
+    }
+  }
+
+  // --- 2. SENSOR READING & UPLOAD (Every 5 Sec) ---
+  if (millis() - prevMillis > 5000) {
+    prevMillis = millis();
+    
+    // Read Temperature
+    sensors.requestTemperatures(); 
+    float t = sensors.getTempCByIndex(0);
+    // Filter noise
+    if (t < -50 || t > 100) t = 0.0;
+
+    // Read Ultrasonic (Level)
+    digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+    digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+    digitalWrite(PIN_TRIG, LOW);
+    long duration = pulseIn(PIN_ECHO, HIGH, 30000); 
+    int lvl = 0;
+    if (duration > 0) {
+      int dist = duration * 0.034 / 2;
+      lvl = constrain(map(dist, TANK_HEIGHT_CM, 2, 0, 100), 0, 100);
+    }
+
+    // Read TDS (Simulated/Analog)
+    int tds = analogRead(PIN_TDS) * 0.5; // Calibration factor
+
+    // Upload to Firebase
+    FirebaseJson json;
+    json.set("temp", t); 
+    json.set("tds", tds); 
+    json.set("level", lvl);
+    json.set("ts", millis()); // Timestamp for keep-alive check
+    
+    Firebase.setJSON(fbdo, "/sensors", json);
+    Serial.printf("T:%.1f C | L:%d %% | TDS:%d ppm\n", t, lvl, tds);
+
+    // --- 3. GOOGLE SHEETS (Every 2 Mins) ---
+    if (millis() - sheetMillis > 120000) {
+      sheetMillis = millis();
+      sendToSheet(t, tds, lvl);
+    }
+
+    // --- 4. CRITICAL ALERTS (Every 30 Sec) ---
+    if (millis() - alertMillis > 30000) {
+      String msg = "";
+      if (t > 30.0) msg += "🔥 Temp High: " + String(t) + "C\n";
+      if (lvl < 50) msg += "💧 Water Low: " + String(lvl) + "%\n";
+      if (tds > 400) msg += "⚠️ TDS High: " + String(tds) + "ppm\n";
+      
+      if (msg != "") {
+        sendTelegram("🚨 ALERT!\n" + msg);
+        alertMillis = millis();
+      }
+    }
+  }
+}
